@@ -1,8 +1,8 @@
 package hk.kirk.trustme.hooks
 
-import de.robv.android.xposed.XC_MethodHook
-import de.robv.android.xposed.XposedHelpers.*
+import hk.kirk.trustme.XCompat
 import hk.kirk.trustme.trust.TrustAllManager
+import hk.kirk.trustme.trust.TrustAllApacheSSLSocketFactory
 import hk.kirk.trustme.utils.Logger
 import hk.kirk.trustme.xprefs.HookPrefs
 import org.apache.http.conn.ClientConnectionManager
@@ -10,20 +10,20 @@ import org.apache.http.conn.scheme.PlainSocketFactory
 import org.apache.http.conn.scheme.Scheme
 import org.apache.http.conn.scheme.SchemeRegistry
 import org.apache.http.conn.ssl.SSLSocketFactory
-import org.apache.http.impl.client.DefaultHttpClient
 import org.apache.http.impl.conn.SingleClientConnManager
 import org.apache.http.impl.conn.tsccm.ThreadSafeClientConnManager
-import org.apache.http.params.HttpParams
-import java.net.Socket
-import java.security.KeyStore
+import java.lang.reflect.Field
 import java.security.SecureRandom
+import java.security.KeyStore
 import javax.net.ssl.KeyManager
 import javax.net.ssl.SSLContext
-import javax.net.ssl.TrustManager
-import javax.net.ssl.X509TrustManager
 
 /**
  * Apache HTTP Client Hook
+ *
+ * Modern API：hook(Executable).intercept(Chain)
+ * 旧版 XposedHelpers.setObjectField / callStaticMethod / newInstance 改为标准反射 +
+ * Invoker（getInvoker 绕过访问检查，替代旧版 XposedBridge.invokeOriginal 语义）
  */
 object ApacheHttpHook {
 
@@ -38,53 +38,64 @@ object ApacheHttpHook {
         hookSchemeRegistry(classLoader)
     }
 
+    private fun setObjectField(target: Any, name: String, value: Any?) {
+        val f: Field = target.javaClass.getDeclaredField(name).apply { isAccessible = true }
+        f.set(target, value)
+    }
+
     private fun hookDefaultHttpClient(classLoader: ClassLoader) {
+        val cls = try {
+            classLoader.loadClass("org.apache.http.impl.client.DefaultHttpClient")
+        } catch (_: Throwable) {
+            return
+        }
+
         // DefaultHttpClient() 无参构造
         try {
-            findAndHookConstructor(
-                DefaultHttpClient::class.java,
-                object : XC_MethodHook() {
-                    override fun afterHookedMethod(param: MethodHookParam) {
-                        if (!HookPrefs.isHookActive("apache")) return
-                        setObjectField(param.thisObject, "defaultParams", null)
-                        setObjectField(param.thisObject, "connManager", createSCCM())
-                    }
+            val ctor = cls.getDeclaredConstructor()
+            XCompat.hookMethod(ctor, after = { _, _, thisObj ->
+                if (!HookPrefs.isHookActive("apache")) return@hookMethod null
+                thisObj?.let {
+                    setObjectField(it, "defaultParams", null)
+                    setObjectField(it, "connManager", createSCCM())
                 }
-            )
+                null
+            })
         } catch (_: Throwable) {
         }
 
         // DefaultHttpClient(HttpParams)
         try {
-            findAndHookConstructor(
-                DefaultHttpClient::class.java, HttpParams::class.java,
-                object : XC_MethodHook() {
-                    override fun afterHookedMethod(param: MethodHookParam) {
-                        if (!HookPrefs.isHookActive("apache")) return
-                        setObjectField(param.thisObject, "defaultParams", param.args[0] as HttpParams)
-                        setObjectField(param.thisObject, "connManager", createSCCM())
-                    }
+            val ctor = cls.getDeclaredConstructor(org.apache.http.params.HttpParams::class.java)
+            XCompat.hookMethod(ctor, after = { args, _, thisObj ->
+                if (!HookPrefs.isHookActive("apache")) return@hookMethod null
+                thisObj?.let {
+                    setObjectField(it, "defaultParams", args[0])
+                    setObjectField(it, "connManager", createSCCM())
                 }
-            )
+                null
+            })
         } catch (_: Throwable) {
         }
 
         // DefaultHttpClient(ClientConnectionManager, HttpParams)
         try {
-            findAndHookConstructor(
-                DefaultHttpClient::class.java, ClientConnectionManager::class.java, HttpParams::class.java,
-                object : XC_MethodHook() {
-                    override fun afterHookedMethod(param: MethodHookParam) {
-                        if (!HookPrefs.isHookActive("apache")) return
-                        val params = param.args[1] as HttpParams
-                        setObjectField(param.thisObject, "defaultParams", params)
-                        setObjectField(
-                            param.thisObject, "connManager",
-                            determineConnManager(param.args[0], params)
-                        )
-                    }
-                }
+            val ctor = cls.getDeclaredConstructor(
+                ClientConnectionManager::class.java,
+                org.apache.http.params.HttpParams::class.java,
             )
+            XCompat.hookMethod(ctor, after = { args, _, thisObj ->
+                if (!HookPrefs.isHookActive("apache")) return@hookMethod null
+                thisObj?.let {
+                    val params = args[1] as org.apache.http.params.HttpParams
+                    setObjectField(it, "defaultParams", params)
+                    setObjectField(
+                        it, "connManager",
+                        determineConnManager(args[0]!!, params)
+                    )
+                }
+                null
+            })
         } catch (_: Throwable) {
         }
 
@@ -92,92 +103,90 @@ object ApacheHttpHook {
     }
 
     private fun hookSSLSocketFactory(classLoader: ClassLoader) {
+        val cls = try {
+            classLoader.loadClass("org.apache.http.conn.ssl.SSLSocketFactory")
+        } catch (_: Throwable) {
+            return
+        }
+
         // SSLSocketFactory 构造函数
         try {
-            findAndHookConstructor(
-                SSLSocketFactory::class.java,
+            val ctor = cls.getDeclaredConstructor(
                 String::class.java, KeyStore::class.java, String::class.java,
                 KeyStore::class.java, SecureRandom::class.java,
                 org.apache.http.conn.scheme.HostNameResolver::class.java,
-                object : XC_MethodHook() {
-                    override fun afterHookedMethod(param: MethodHookParam) {
-                        if (!HookPrefs.isHookActive("apache")) return
-                        val algorithm = param.args[0] as String
-                        val keystore = param.args[1] as? KeyStore
-                        val keystorePassword = param.args[2] as? String
-                        val random = param.args[4] as? SecureRandom
-
-                        var keyManagers: Array<KeyManager>? = null
-                        if (keystore != null) {
-                            keyManagers = callStaticMethod(
-                                SSLSocketFactory::class.java,
-                                "createKeyManagers", keystore, keystorePassword
-                            ) as Array<KeyManager>
-                        }
-
-                        val trustManagers = TrustAllManager.getBestInstanceArray()
-                        val sslContext = SSLContext.getInstance(algorithm)
-                        sslContext.init(keyManagers, trustManagers, random)
-                        setObjectField(param.thisObject, "sslcontext", sslContext)
-                        setObjectField(
-                            param.thisObject, "socketfactory",
-                            sslContext.socketFactory
-                        )
-                    }
-                }
             )
+            XCompat.hookMethod(ctor, after = { args, _, thisObj ->
+                if (!HookPrefs.isHookActive("apache")) return@hookMethod null
+                thisObj?.let { obj ->
+                    val algorithm = args[0] as String
+                    val keystore = args[1] as? KeyStore
+                    val keystorePassword = args[2] as? String
+                    val random = args[4] as? SecureRandom
+
+                    var keyManagers: Array<KeyManager>? = null
+                    if (keystore != null) {
+                        keyManagers = callStaticKeyManagers(cls, keystore, keystorePassword)
+                    }
+
+                    val trustManagers = TrustAllManager.getBestInstanceArray()
+                    val sslContext = SSLContext.getInstance(algorithm)
+                    sslContext.init(keyManagers, trustManagers, random)
+                    setObjectField(obj, "sslcontext", sslContext)
+                    setObjectField(obj, "socketfactory", sslContext.socketFactory)
+                }
+                null
+            })
         } catch (_: Throwable) {
         }
 
-        // SSLSocketFactory.getSocketFactory()
+        // SSLSocketFactory.getSocketFactory() → 返回信任一切的实例
         try {
-            findAndHookMethod(
-                "org.apache.http.conn.ssl.SSLSocketFactory", classLoader,
-                "getSocketFactory",
-                object : XC_MethodHook() {
-                    override fun beforeHookedMethod(param: MethodHookParam) {
-                        if (!HookPrefs.isHookActive("apache")) return
-                        param.result = newInstance(SSLSocketFactory::class.java)
-                    }
-                }
-            )
+            val m = cls.getDeclaredMethod("getSocketFactory")
+            XCompat.hookMethod(m, before = { _, _ ->
+                if (!HookPrefs.isHookActive("apache")) return@hookMethod null
+                TrustAllApacheSSLSocketFactory.getDefault()
+            })
         } catch (_: Throwable) {
         }
 
         // SSLSocketFactory.isSecure(Socket) → DO_NOTHING
         try {
-            findAndHookMethod(
-                "org.apache.http.conn.ssl.SSLSocketFactory", classLoader,
-                "isSecure", Socket::class.java,
-                object : XC_MethodHook() {
-                    override fun beforeHookedMethod(param: MethodHookParam) {
-                        if (!HookPrefs.isHookActive("apache")) return
-                        param.result = null
-                    }
-                }
-            )
+            val m = cls.getDeclaredMethod("isSecure", java.net.Socket::class.java)
+            XCompat.hookMethod(m, before = { _, _ ->
+                if (!HookPrefs.isHookActive("apache")) return@hookMethod null
+                null
+            })
         } catch (_: Throwable) {
         }
 
         Logger.d("Apache SSLSocketFactory → 已 Hook")
     }
 
+    private fun callStaticKeyManagers(cls: Class<*>, keystore: KeyStore, password: String?): Array<KeyManager>? {
+        return try {
+            val m = cls.getDeclaredMethod(
+                "createKeyManagers", KeyStore::class.java, String::class.java
+            ).apply { isAccessible = true }
+            @Suppress("UNCHECKED_CAST")
+            m.invoke(null, keystore, password) as Array<KeyManager>
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
     private fun hookSchemeRegistry(classLoader: ClassLoader) {
         // 替换 HTTPS scheme
         try {
-            findAndHookMethod(
-                "org.apache.http.conn.scheme.SchemeRegistry", classLoader,
-                "register", Scheme::class.java,
-                object : XC_MethodHook() {
-                    override fun beforeHookedMethod(param: MethodHookParam) {
-                        if (!HookPrefs.isHookActive("apache")) return
-                        val scheme = param.args[0] as Scheme
-                        if (scheme.name == "https") {
-                            param.args[0] = Scheme("https", SSLSocketFactory.getSocketFactory(), 443)
-                        }
-                    }
-                }
-            )
+            val cls = classLoader.loadClass("org.apache.http.conn.scheme.SchemeRegistry")
+            val m = cls.getDeclaredMethod("register", Scheme::class.java)
+            XCompat.hookMethodArgs(m) { args ->
+                if (!HookPrefs.isHookActive("apache")) return@hookMethodArgs null
+                val scheme = args[0] as Scheme
+                if (scheme.name == "https") {
+                    arrayOf(Scheme("https", TrustAllApacheSSLSocketFactory.getDefault(), 443))
+                } else null
+            }
         } catch (_: Throwable) {
         }
     }
@@ -199,7 +208,7 @@ object ApacheHttpHook {
         }
     }
 
-    private fun createTSCCM(params: HttpParams): ClientConnectionManager? {
+    private fun createTSCCM(params: org.apache.http.params.HttpParams): ClientConnectionManager? {
         return try {
             val trustStore = KeyStore.getInstance(KeyStore.getDefaultType())
             trustStore.load(null, null)
@@ -214,7 +223,7 @@ object ApacheHttpHook {
         }
     }
 
-    private fun determineConnManager(original: Any, params: HttpParams): ClientConnectionManager? {
+    private fun determineConnManager(original: Any, params: org.apache.http.params.HttpParams): ClientConnectionManager? {
         return when (original.javaClass.simpleName) {
             "SingleClientConnManager" -> createSCCM()
             "ThreadSafeClientConnManager" -> createTSCCM(params)
@@ -224,25 +233,11 @@ object ApacheHttpHook {
 
     private fun hasApacheHttpClient(): Boolean {
         return try {
-            Class.forName("org.apache.http.impl.client.DefaultHttpClient")
-            true
+            ApacheHttpHook::class.java.classLoader?.let {
+                Class.forName("org.apache.http.impl.client.DefaultHttpClient", false, it)
+            } != null
         } catch (_: ClassNotFoundException) {
             false
-        }
-    }
-
-    /** 信任一切的 Apache SSLSocketFactory */
-    class TrustAllApacheSSLSocketFactory(truststore: KeyStore) : SSLSocketFactory(truststore) {
-        private val sslContext = SSLContext.getInstance("TLS").apply {
-            init(null, arrayOf<TrustManager>(TrustAllManager.getInstance()), null)
-        }
-
-        override fun createSocket(socket: Socket, host: String, port: Int, autoClose: Boolean): Socket {
-            return sslContext.socketFactory.createSocket(socket, host, port, autoClose)
-        }
-
-        override fun createSocket(): Socket {
-            return sslContext.socketFactory.createSocket()
         }
     }
 }

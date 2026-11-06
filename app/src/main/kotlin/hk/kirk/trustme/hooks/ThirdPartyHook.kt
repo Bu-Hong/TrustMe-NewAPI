@@ -1,18 +1,19 @@
 package hk.kirk.trustme.hooks
 
-import de.robv.android.xposed.XC_MethodHook
-import de.robv.android.xposed.XposedHelpers.findAndHookMethod
+import hk.kirk.trustme.XCompat
 import hk.kirk.trustme.trust.TrustAllHostnameVerifier
+import hk.kirk.trustme.trust.TrustAllManager
 import hk.kirk.trustme.utils.Logger
 import hk.kirk.trustme.xprefs.HookPrefs
 import javax.net.ssl.HostnameVerifier
 import javax.net.ssl.SSLContext
 import javax.net.ssl.SSLSocketFactory
 import javax.net.ssl.TrustManager
-import hk.kirk.trustme.trust.TrustAllManager
 
 /**
  * 第三方库 Hook — xutils / httpclientandroidlib
+ *
+ * Modern API：hook(Executable).intercept(Chain)
  */
 object ThirdPartyHook {
 
@@ -26,31 +27,21 @@ object ThirdPartyHook {
      */
     private fun hookXutils(classLoader: ClassLoader) {
         try {
-            classLoader.loadClass("org.xutils.http.RequestParams")
+            val cls = classLoader.loadClass("org.xutils.http.RequestParams")
 
             // setSslSocketFactory → 替换为空 SSLFactory
-            findAndHookMethod(
-                "org.xutils.http.RequestParams", classLoader,
-                "setSslSocketFactory", SSLSocketFactory::class.java,
-                object : XC_MethodHook() {
-                    override fun beforeHookedMethod(param: MethodHookParam) {
-                        if (!HookPrefs.isHookActive("thirdparty")) return
-                        param.args[0] = createEmptySSLFactory()
-                    }
-                }
-            )
+            val m1 = cls.getDeclaredMethod("setSslSocketFactory", SSLSocketFactory::class.java)
+            XCompat.hookMethodArgs(m1) { args ->
+                if (!HookPrefs.isHookActive("thirdparty")) return@hookMethodArgs null
+                arrayOf<Any?>(createEmptySSLFactory())
+            }
 
             // setHostnameVerifier → 替换为 TrustAllHostnameVerifier
-            findAndHookMethod(
-                "org.xutils.http.RequestParams", classLoader,
-                "setHostnameVerifier", HostnameVerifier::class.java,
-                object : XC_MethodHook() {
-                    override fun beforeHookedMethod(param: MethodHookParam) {
-                        if (!HookPrefs.isHookActive("thirdparty")) return
-                        param.args[0] = TrustAllHostnameVerifier.getInstance()
-                    }
-                }
-            )
+            val m2 = cls.getDeclaredMethod("setHostnameVerifier", HostnameVerifier::class.java)
+            XCompat.hookMethodArgs(m2) { args ->
+                if (!HookPrefs.isHookActive("thirdparty")) return@hookMethodArgs null
+                arrayOf<Any?>(TrustAllHostnameVerifier.getInstance())
+            }
 
             Logger.d("xutils RequestParams → 已 Hook")
         } catch (_: ClassNotFoundException) {
@@ -65,19 +56,16 @@ object ThirdPartyHook {
      */
     private fun hookHttpClientAndroidLib(classLoader: ClassLoader) {
         try {
-            classLoader.loadClass("ch.boye.httpclientandroidlib.conn.ssl.AbstractVerifier")
-            findAndHookMethod(
-                "ch.boye.httpclientandroidlib.conn.ssl.AbstractVerifier", classLoader,
+            val cls = classLoader.loadClass("ch.boye.httpclientandroidlib.conn.ssl.AbstractVerifier")
+            val m = cls.getDeclaredMethod(
                 "verify",
                 String::class.java, Array<String>::class.java,
                 Array<String>::class.java, Boolean::class.javaPrimitiveType,
-                object : XC_MethodHook() {
-                    override fun beforeHookedMethod(param: MethodHookParam) {
-                        if (!HookPrefs.isHookActive("thirdparty")) return
-                        param.result = null
-                    }
-                }
             )
+            XCompat.hookMethod(m, before = { _, _ ->
+                if (!HookPrefs.isHookActive("thirdparty")) return@hookMethod null
+                null
+            })
             Logger.d("httpclientandroidlib AbstractVerifier → 已绕过")
         } catch (_: ClassNotFoundException) {
             Logger.d("httpclientandroidlib 未发现，跳过")

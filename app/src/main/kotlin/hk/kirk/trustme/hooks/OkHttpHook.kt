@@ -2,9 +2,7 @@ package hk.kirk.trustme.hooks
 
 import android.content.pm.ApplicationInfo
 import dalvik.system.DexFile
-import de.robv.android.xposed.XC_MethodHook
-import de.robv.android.xposed.XposedBridge
-import de.robv.android.xposed.XposedHelpers.findAndHookMethod
+import hk.kirk.trustme.XCompat
 import hk.kirk.trustme.utils.Logger
 import hk.kirk.trustme.xprefs.HookPrefs
 import java.lang.reflect.Method
@@ -18,6 +16,8 @@ import javax.net.ssl.SSLSession
  * OkHttp 2.x / 3.x / 4.x+ CertificatePinner & HostnameVerifier Hook
  *
  * 通过 Application.attach() 的 ClassLoader 调用，确保 Multi-dex 支持
+ *
+ * Modern API：hook(Executable).intercept(Chain)
  */
 object OkHttpHook {
 
@@ -39,17 +39,12 @@ object OkHttpHook {
     /** OkHttp 2.x — com.squareup.okhttp.CertificatePinner */
     private fun hookOkHttp2(classLoader: ClassLoader) {
         try {
-            classLoader.loadClass("com.squareup.okhttp.CertificatePinner")
-            findAndHookMethod(
-                "com.squareup.okhttp.CertificatePinner", classLoader,
-                "check", String::class.java, List::class.java,
-                object : XC_MethodHook() {
-                    override fun beforeHookedMethod(param: MethodHookParam) {
-                        if (!HookPrefs.isHookActive("okhttp")) return
-                        param.result = true
-                    }
-                }
-            )
+            val cls = classLoader.loadClass("com.squareup.okhttp.CertificatePinner")
+            val m = cls.getDeclaredMethod("check", String::class.java, List::class.java)
+            XCompat.hookMethod(m, before = { _, _ ->
+                if (!HookPrefs.isHookActive("okhttp")) return@hookMethod null
+                true
+            })
             Logger.d("OkHttp 2.x CertificatePinner.check → 已绕过")
         } catch (_: ClassNotFoundException) {
             Logger.d("OkHttp 2.x 未发现，跳过")
@@ -61,17 +56,12 @@ object OkHttpHook {
     /** OkHttp 3.x — okhttp3.CertificatePinner */
     private fun hookOkHttp3(classLoader: ClassLoader) {
         try {
-            classLoader.loadClass("okhttp3.CertificatePinner")
-            findAndHookMethod(
-                "okhttp3.CertificatePinner", classLoader,
-                "check", String::class.java, List::class.java,
-                object : XC_MethodHook() {
-                    override fun beforeHookedMethod(param: MethodHookParam) {
-                        if (!HookPrefs.isHookActive("okhttp")) return
-                        param.result = null
-                    }
-                }
-            )
+            val cls = classLoader.loadClass("okhttp3.CertificatePinner")
+            val m = cls.getDeclaredMethod("check", String::class.java, List::class.java)
+            XCompat.hookMethod(m, before = { _, _ ->
+                if (!HookPrefs.isHookActive("okhttp")) return@hookMethod null
+                null
+            })
             Logger.d("OkHttp 3.x CertificatePinner.check → 已绕过")
         } catch (_: ClassNotFoundException) {
             Logger.d("OkHttp 3.x 未发现，跳过")
@@ -83,22 +73,19 @@ object OkHttpHook {
     /** OkHttp 4.2+ (Kotlin) — check$okhttp 方法 */
     private fun hookOkHttp4(classLoader: ClassLoader) {
         try {
-            classLoader.loadClass("okhttp3.CertificatePinner")
-            findAndHookMethod(
-                "okhttp3.CertificatePinner", classLoader,
+            val cls = classLoader.loadClass("okhttp3.CertificatePinner")
+            val m = cls.getDeclaredMethod(
                 "check\$okhttp",
                 String::class.java,
-                "kotlin.jvm.functions.Function0",
-                object : XC_MethodHook() {
-                    override fun beforeHookedMethod(param: MethodHookParam) {
-                        if (!HookPrefs.isHookActive("okhttp")) return
-                        param.result = null
-                    }
-                }
+                classLoader.loadClass("kotlin.jvm.functions.Function0"),
             )
+            XCompat.hookMethod(m, before = { _, _ ->
+                if (!HookPrefs.isHookActive("okhttp")) return@hookMethod null
+                null
+            })
             Logger.d("OkHttp 4.2+ check\$okhttp → 已绕过")
         } catch (_: ClassNotFoundException) {
-        } catch (_: NoSuchMethodError) {
+        } catch (_: NoSuchMethodException) {
             Logger.d("OkHttp 4.2+ check\$okhttp 方法不存在，跳过")
         } catch (e: Throwable) {
             Logger.e("OkHttp 4.2+ Hook 失败", e)
@@ -107,62 +94,53 @@ object OkHttpHook {
 
     /** OkHostnameVerifier.verify — 两个重载 */
     private fun hookOkHostnameVerifier(classLoader: ClassLoader) {
-        // verify(String, SSLSession)
         try {
-            classLoader.loadClass("okhttp3.internal.tls.OkHostnameVerifier")
-            findAndHookMethod(
-                "okhttp3.internal.tls.OkHostnameVerifier", classLoader,
-                "verify", String::class.java, SSLSession::class.java,
-                object : XC_MethodHook() {
-                    override fun beforeHookedMethod(param: MethodHookParam) {
-                        if (!HookPrefs.isHookActive("okhttp")) return
-                        param.result = true
-                    }
-                }
-            )
-            Logger.d("OkHostnameVerifier.verify(String, SSLSession) → 已绕过")
-        } catch (_: ClassNotFoundException) {
-        } catch (e: Throwable) {
-            Logger.e("OkHostnameVerifier(SSLSession) Hook 失败", e)
-        }
+            val cls = classLoader.loadClass("okhttp3.internal.tls.OkHostnameVerifier")
 
-        // verify(String, X509Certificate)
-        try {
-            classLoader.loadClass("okhttp3.internal.tls.OkHostnameVerifier")
-            findAndHookMethod(
-                "okhttp3.internal.tls.OkHostnameVerifier", classLoader,
-                "verify", String::class.java, X509Certificate::class.java,
-                object : XC_MethodHook() {
-                    override fun beforeHookedMethod(param: MethodHookParam) {
-                        if (!HookPrefs.isHookActive("okhttp")) return
-                        param.result = true
-                    }
-                }
-            )
-            Logger.d("OkHostnameVerifier.verify(String, X509Certificate) → 已绕过")
+            // verify(String, SSLSession)
+            try {
+                val m1 = cls.getDeclaredMethod("verify", String::class.java, SSLSession::class.java)
+                XCompat.hookMethod(m1, before = { _, _ ->
+                    if (!HookPrefs.isHookActive("okhttp")) return@hookMethod null
+                    true
+                })
+                Logger.d("OkHostnameVerifier.verify(String, SSLSession) → 已绕过")
+            } catch (_: NoSuchMethodException) {
+            } catch (e: Throwable) {
+                Logger.e("OkHostnameVerifier(SSLSession) Hook 失败", e)
+            }
+
+            // verify(String, X509Certificate)
+            try {
+                val m2 = cls.getDeclaredMethod("verify", String::class.java, X509Certificate::class.java)
+                XCompat.hookMethod(m2, before = { _, _ ->
+                    if (!HookPrefs.isHookActive("okhttp")) return@hookMethod null
+                    true
+                })
+                Logger.d("OkHostnameVerifier.verify(String, X509Certificate) → 已绕过")
+            } catch (_: NoSuchMethodException) {
+            } catch (e: Throwable) {
+                Logger.e("OkHostnameVerifier(X509Certificate) Hook 失败", e)
+            }
         } catch (_: ClassNotFoundException) {
         } catch (e: Throwable) {
-            Logger.e("OkHostnameVerifier(X509Certificate) Hook 失败", e)
+            Logger.e("OkHostnameVerifier Hook 失败", e)
         }
     }
 
     /** findMatchingPins — SSLUnpinning 的不同策略：清空 hostname 使查找不到 pin */
     private fun hookFindMatchingPins(classLoader: ClassLoader) {
         try {
-            classLoader.loadClass("okhttp3.CertificatePinner")
-            findAndHookMethod(
-                "okhttp3.CertificatePinner", classLoader,
-                "findMatchingPins", String::class.java,
-                object : XC_MethodHook() {
-                    override fun beforeHookedMethod(param: MethodHookParam) {
-                        if (!HookPrefs.isHookActive("okhttp")) return
-                        param.args[0] = ""
-                    }
-                }
-            )
+            val cls = classLoader.loadClass("okhttp3.CertificatePinner")
+            val m = cls.getDeclaredMethod("findMatchingPins", String::class.java)
+            XCompat.hookMethodArgs(m) { args ->
+                if (!HookPrefs.isHookActive("okhttp")) return@hookMethodArgs null
+                Logger.d("OkHttp3 findMatchingPins → hostname 已清空")
+                arrayOf("")
+            }
             Logger.d("OkHttp3 findMatchingPins → hostname 已清空")
         } catch (_: ClassNotFoundException) {
-        } catch (_: NoSuchMethodError) {
+        } catch (_: NoSuchMethodException) {
         } catch (e: Throwable) {
             Logger.e("findMatchingPins Hook 失败", e)
         }
@@ -315,15 +293,10 @@ object OkHttpHook {
 
         return try {
             method.isAccessible = true
-            XposedBridge.hookMethod(
-                method,
-                object : XC_MethodHook() {
-                    override fun beforeHookedMethod(param: MethodHookParam) {
-                        if (!HookPrefs.isHookActive("okhttp")) return
-                        param.result = null
-                    }
-                }
-            )
+            XCompat.hookMethod(method, before = { _, _ ->
+                if (!HookPrefs.isHookActive("okhttp")) return@hookMethod null
+                null
+            })
             Logger.d("Relocated OkHttp CertificatePinner ${method.declaringClass.name}.${method.name} → 已绕过")
             true
         } catch (e: Throwable) {

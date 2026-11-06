@@ -9,9 +9,8 @@ import java.io.FileWriter
  * 文件日志写入器 — 将结构化日志写入 JSONL 文件
  *
  * 写入路径: /data/data/hk.kirk.trustme/shared_prefs/trustme_logs.jsonl
- * 使用模块自身的 shared_prefs 目录，因为:
- * - Xposed 模块声明了 MODE_WORLD_READABLE，其他进程可读
- * - App UI 进程自然有权限读取自身目录
+ * 写入发生在 Hook 端进程（无 context），因此仍使用硬编码模块数据目录；
+ * 该文件日志方案与 Modern API 无关，在新版框架下继续可用。
  */
 object LogFileWriter {
 

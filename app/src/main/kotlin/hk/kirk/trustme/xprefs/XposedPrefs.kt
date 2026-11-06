@@ -2,22 +2,23 @@ package hk.kirk.trustme.xprefs
 
 import android.content.Context
 import android.content.SharedPreferences
-import de.robv.android.xposed.XSharedPreferences
-import java.io.File
+import io.github.libxposed.service.XposedService
+import io.github.libxposed.service.XposedServiceHelper
+import java.util.concurrent.CopyOnWriteArraySet
+import kotlin.concurrent.Volatile
 
 /**
- * Xposed 模块配置存储桥
+ * Xposed 模块配置存储桥（Modern API / Remote Preferences）
  *
- * 透明地解决模块 UI 端与 Hook（宿主进程）端之间 SharedPreferences 的跨进程读取问题。
+ * 旧版 XSharedPreferences / MODE_WORLD_READABLE / 手动改文件权限在 targetApiVersion=102
+ * 下已不可用（模块不能调用 legacy de.robv API）。按官方文档迁移到远程首选项：
+ * - 模块 UI 端：通过 libxposed service（XposedServiceHelper）拿到 XposedService，
+ *   用 service.getRemotePreferences(group) 读写
+ * - Hook 端：通过 XposedInterface.getRemotePreferences(group) 只读
  *
  * 用法：
  * - 模块 UI 端: `XposedPrefs.module(context, "my_prefs")`  → 读/写
  * - Hook 端:    `XposedPrefs.hook("com.example.module", "my_prefs")` → 只读
- *
- * 设计亮点:
- * - 零框架依赖，单文件可复制到任意项目
- * - sealed class 编译期区分环境
- * - 自动检测 New XSharedPreferences (LSPosed)，跳过不必要的文件权限修改
  */
 sealed class XposedPrefs {
 
@@ -38,7 +39,7 @@ sealed class XposedPrefs {
          * 创建模块 UI 端实例（读写）
          *
          * @param context Activity/Application 的 Context
-         * @param prefsName SharedPreferences 文件名（不含 .xml）
+         * @param prefsName 远程首选项 group 名
          */
         fun module(context: Context, prefsName: String): ModuleSide =
             ModuleSide(context, prefsName)
@@ -46,49 +47,103 @@ sealed class XposedPrefs {
         /**
          * 创建 Hook（宿主进程）端实例（只读）
          *
-         * @param modulePackageName 模块的包名
-         * @param prefsName SharedPreferences 文件名（不含 .xml）
+         * @param modulePackageName 模块的包名（仅为兼容旧签名保留）
+         * @param prefsName 远程首选项 group 名
          */
         fun hook(modulePackageName: String, prefsName: String): HookSide =
-            HookSide(modulePackageName, prefsName)
+            HookSide(prefsName)
     }
 
     // ========================================================================
-    // 模块 UI 端 — 读写
+    // 服务绑定 — 模块 App 端通过 libxposed service 与框架通信
+    // ========================================================================
+
+    object ServiceHolder {
+        @Volatile
+        var service: XposedService? = null
+            private set
+
+        private val listeners = CopyOnWriteArraySet<(XposedService?) -> Unit>()
+
+        /** 在 Application.onCreate 中调用一次 */
+        fun register() {
+            XposedServiceHelper.registerListener(object : XposedServiceHelper.OnServiceListener {
+                override fun onServiceBind(service: XposedService) {
+                    ServiceHolder.service = service
+                    listeners.forEach { it(service) }
+                }
+
+                override fun onServiceDied(service: XposedService) {
+                    ServiceHolder.service = null
+                    listeners.forEach { it(null) }
+                }
+            })
+        }
+
+        fun addListener(listener: (XposedService?) -> Unit) {
+            listeners.add(listener)
+            service?.let(listener)
+        }
+    }
+
+    // ========================================================================
+    // 模块 UI 端 — 读写（远程首选项 + 本地镜像）
     // ========================================================================
 
     class ModuleSide internal constructor(
-        private val context: Context,
+        context: Context,
         private val prefsName: String,
     ) : XposedPrefs() {
 
-        /** 是否处于 New XSharedPreferences 模式（LSPosed 接管了跨进程通信） */
-        var isNewXShareMode: Boolean = false
-            private set
+        /** 本地镜像：service 未绑定时保证 UI 状态可读写，绑定后写操作同步到远程 */
+        private val sp: SharedPreferences =
+            context.getSharedPreferences("${prefsName}_local", Context.MODE_PRIVATE)
 
-        private val sp: SharedPreferences = try {
-            @Suppress("DEPRECATION", "WorldReadableFiles")
-            context.getSharedPreferences(prefsName, Context.MODE_WORLD_READABLE).also {
-                isNewXShareMode = true
-            }
-        } catch (_: SecurityException) {
-            context.getSharedPreferences(prefsName, Context.MODE_PRIVATE).also {
-                isNewXShareMode = false
-                // 传统模式：手动修改文件权限
-                makeWorldReadable()
-            }
+        private val remote: SharedPreferences?
+            get() = ServiceHolder.service?.getRemotePreferences(prefsName)
+
+        override val isAvailable: Boolean
+            get() = ServiceHolder.service != null
+
+        override fun getBoolean(key: String, default: Boolean): Boolean {
+            remote?.let { return it.getBoolean(key, sp.getBoolean(key, default)) }
+            return sp.getBoolean(key, default)
         }
 
-        override val isAvailable: Boolean get() = true
+        override fun getString(key: String, default: String): String {
+            remote?.let { return it.getString(key, sp.getString(key, default) ?: default) ?: default }
+            return sp.getString(key, default) ?: default
+        }
 
-        override fun getBoolean(key: String, default: Boolean) = sp.getBoolean(key, default)
-        override fun getString(key: String, default: String) = sp.getString(key, default) ?: default
-        override fun getInt(key: String, default: Int) = sp.getInt(key, default)
-        override fun getLong(key: String, default: Long) = sp.getLong(key, default)
-        override fun getFloat(key: String, default: Float) = sp.getFloat(key, default)
-        override fun getStringSet(key: String, default: Set<String>) = sp.getStringSet(key, default) ?: default
-        override fun contains(key: String) = sp.contains(key)
-        override fun all(): Map<String, *> = sp.all
+        override fun getInt(key: String, default: Int): Int {
+            remote?.let { return it.getInt(key, sp.getInt(key, default)) }
+            return sp.getInt(key, default)
+        }
+
+        override fun getLong(key: String, default: Long): Long {
+            remote?.let { return it.getLong(key, sp.getLong(key, default)) }
+            return sp.getLong(key, default)
+        }
+
+        override fun getFloat(key: String, default: Float): Float {
+            remote?.let { return it.getFloat(key, sp.getFloat(key, default)) }
+            return sp.getFloat(key, default)
+        }
+
+        override fun getStringSet(key: String, default: Set<String>): Set<String> {
+            remote?.let { return it.getStringSet(key, sp.getStringSet(key, default) ?: default) ?: default }
+            return sp.getStringSet(key, default) ?: default
+        }
+
+        override fun contains(key: String): Boolean {
+            remote?.let { return it.contains(key) }
+            return sp.contains(key)
+        }
+
+        override fun all(): Map<String, *> {
+            remote?.let { return it.all }
+            return sp.all
+        }
 
         /** 写入 Boolean 值 */
         fun putBoolean(key: String, value: Boolean) = edit { putBoolean(key, value) }
@@ -114,120 +169,40 @@ sealed class XposedPrefs {
         /** 清空所有数据 */
         fun clear() = edit { clear() }
 
-        /** 编辑并提交，自动处理权限 */
+        /** 编辑并提交：远程优先，本地镜像同步 */
         private inline fun edit(crossinline block: SharedPreferences.Editor.() -> Unit) {
-            sp.edit().apply { block() }.commit()
-            if (!isNewXShareMode) makeWorldReadable()
+            sp.edit().apply { block() }.apply()
+            remote?.edit()?.apply { block() }?.apply()
         }
-
-        /**
-         * 确保 prefs 文件和父目录对其他进程可读
-         *
-         * 仅在传统模式（非 New XSharedPreferences）下调用
-         */
-        fun makeWorldReadable() {
-            runCatching {
-                val dataDir = File(context.applicationInfo.dataDir)
-                dataDir.setExecutable(true, false)
-
-                val prefsDir = File(dataDir, "shared_prefs")
-                prefsDir.setReadable(true, false)
-                prefsDir.setExecutable(true, false)
-
-                val prefsFile = File(prefsDir, "$prefsName.xml")
-                if (prefsFile.exists()) {
-                    prefsFile.setReadable(true, false)
-                }
-            }
-        }
-
-        /**
-         * 确保指定文件对其他进程可读可写（用于日志文件等）
-         */
-        fun makeFileWorldWritable(fileName: String) {
-            runCatching {
-                val prefsDir = File(context.applicationInfo.dataDir, "shared_prefs")
-                prefsDir.setWritable(true, false)
-
-                val file = File(prefsDir, fileName)
-                if (!file.exists()) file.createNewFile()
-                file.setReadable(true, false)
-                file.setWritable(true, false)
-            }
-        }
-
-        /** 获取 shared_prefs 目录路径 */
-        val prefsDir: File
-            get() = File(context.applicationInfo.dataDir, "shared_prefs")
     }
 
     // ========================================================================
-    // Hook（宿主进程）端 — 只读
+    // Hook（宿主进程）端 — 只读（XposedInterface.getRemotePreferences）
     // ========================================================================
 
     class HookSide internal constructor(
-        private val modulePackageName: String,
         private val prefsName: String,
     ) : XposedPrefs() {
 
-        private val xsp: XSharedPreferences? = try {
-            XSharedPreferences(modulePackageName, prefsName).apply {
-                makeWorldReadable()
-            }
-        } catch (e: Throwable) {
-            null
-        }
+        /** Hook 端远程首选项，由 MainHook 在 onModuleLoaded 时注入 */
+        @Volatile
+        internal var remote: SharedPreferences? = null
 
         override val isAvailable: Boolean
-            get() = xsp?.file?.let { it.exists() && it.canRead() } ?: false
+            get() = remote != null
 
-        /** 重新加载配置（从磁盘） */
+        /** 兼容旧接口：远程首选项实时读取，无需重载 */
         fun reload() {
-            runCatching { xsp?.reload() }
+            // Remote Preferences 由框架实时同步，无需 reload
         }
 
-        override fun getBoolean(key: String, default: Boolean): Boolean {
-            reload()
-            return xsp?.getBoolean(key, default) ?: default
-        }
-
-        override fun getString(key: String, default: String): String {
-            reload()
-            return xsp?.getString(key, default) ?: default
-        }
-
-        override fun getInt(key: String, default: Int): Int {
-            reload()
-            return xsp?.getInt(key, default) ?: default
-        }
-
-        override fun getLong(key: String, default: Long): Long {
-            reload()
-            return xsp?.getLong(key, default) ?: default
-        }
-
-        override fun getFloat(key: String, default: Float): Float {
-            reload()
-            return xsp?.getFloat(key, default) ?: default
-        }
-
-        override fun getStringSet(key: String, default: Set<String>): Set<String> {
-            reload()
-            return xsp?.getStringSet(key, default) ?: default
-        }
-
-        override fun contains(key: String): Boolean {
-            reload()
-            return xsp?.contains(key) ?: false
-        }
-
-        override fun all(): Map<String, *> {
-            reload()
-            return xsp?.all ?: emptyMap<String, Any>()
-        }
-
-        /** XSharedPreferences 底层文件路径（调试用） */
-        val filePath: String?
-            get() = xsp?.file?.absolutePath
+        override fun getBoolean(key: String, default: Boolean) = remote?.getBoolean(key, default) ?: default
+        override fun getString(key: String, default: String) = remote?.getString(key, default) ?: default
+        override fun getInt(key: String, default: Int) = remote?.getInt(key, default) ?: default
+        override fun getLong(key: String, default: Long) = remote?.getLong(key, default) ?: default
+        override fun getFloat(key: String, default: Float) = remote?.getFloat(key, default) ?: default
+        override fun getStringSet(key: String, default: Set<String>) = remote?.getStringSet(key, default) ?: default
+        override fun contains(key: String) = remote?.contains(key) ?: false
+        override fun all(): Map<String, *> = remote?.all ?: emptyMap<String, Any>()
     }
 }

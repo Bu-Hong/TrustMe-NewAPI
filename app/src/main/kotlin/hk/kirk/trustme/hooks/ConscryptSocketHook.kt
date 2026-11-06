@@ -1,8 +1,6 @@
 package hk.kirk.trustme.hooks
 
-import de.robv.android.xposed.XC_MethodHook
-import de.robv.android.xposed.XposedHelpers.findAndHookMethod
-import de.robv.android.xposed.XposedHelpers.findClass
+import hk.kirk.trustme.XCompat
 import hk.kirk.trustme.utils.Logger
 import hk.kirk.trustme.xprefs.HookPrefs
 
@@ -11,6 +9,8 @@ import hk.kirk.trustme.xprefs.HookPrefs
  *
  * 这些是比 TrustManagerImpl 更底层的 Hook 点，
  * 直接在 SSL Socket 层面绕过证书链验证。
+ *
+ * Modern API：hook(Executable).intercept(Chain)
  */
 object ConscryptSocketHook {
 
@@ -33,21 +33,15 @@ object ConscryptSocketHook {
 
     private fun hookVerifyCertificateChain(classLoader: ClassLoader, className: String) {
         try {
-            val cls = findClass(className, classLoader)
+            val cls = classLoader.loadClass(className)
             // 查找所有名为 verifyCertificateChain 的方法并 Hook
             for (method in cls.declaredMethods) {
                 if (method.name == "verifyCertificateChain") {
-                    val params = mutableListOf<Any>()
-                    params.addAll(method.parameterTypes.toList())
-                    params.add(object : XC_MethodHook() {
-                        override fun beforeHookedMethod(param: MethodHookParam) {
-                            if (!HookPrefs.isHookActive("conscryptsocket")) return
-                            param.result = null
-                        }
-                    })
-
                     try {
-                        findAndHookMethod(className, classLoader, "verifyCertificateChain", *params.toTypedArray())
+                        XCompat.hookMethod(method, before = { _, _ ->
+                            if (!HookPrefs.isHookActive("conscryptsocket")) return@hookMethod null
+                            null
+                        })
                         Logger.d("$className.verifyCertificateChain → 已绕过")
                     } catch (_: Throwable) {
                     }
@@ -60,23 +54,14 @@ object ConscryptSocketHook {
 
     private fun hookPlatformCheckServerTrusted(classLoader: ClassLoader) {
         try {
-            val cls = findClass("com.android.org.conscrypt.Platform", classLoader)
+            val cls = classLoader.loadClass("com.android.org.conscrypt.Platform")
             for (method in cls.declaredMethods) {
                 if (method.name == "checkServerTrusted") {
-                    val params = mutableListOf<Any>()
-                    params.addAll(method.parameterTypes.toList())
-                    params.add(object : XC_MethodHook() {
-                        override fun beforeHookedMethod(param: MethodHookParam) {
-                            if (!HookPrefs.isHookActive("conscryptsocket")) return
-                            param.result = null
-                        }
-                    })
-
                     try {
-                        findAndHookMethod(
-                            "com.android.org.conscrypt.Platform", classLoader,
-                            "checkServerTrusted", *params.toTypedArray()
-                        )
+                        XCompat.hookMethod(method, before = { _, _ ->
+                            if (!HookPrefs.isHookActive("conscryptsocket")) return@hookMethod null
+                            null
+                        })
                         Logger.d("Conscrypt Platform.checkServerTrusted → 已绕过")
                     } catch (_: Throwable) {
                     }

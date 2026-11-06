@@ -5,6 +5,9 @@ import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import hk.kirk.trustme.ui.theme.TrustMeTheme
 import hk.kirk.trustme.xprefs.XposedPrefs
 
@@ -15,11 +18,10 @@ class SettingsActivity : ComponentActivity() {
 
     companion object {
         private const val PREFS_NAME = "trustme_prefs"
-
-        /** 模块激活状态 — MainHook 在 onCreate 前通过 Xposed 设为 true */
-        @JvmStatic
-        var isModuleActive = false
     }
+
+    /** 模块激活状态 — 通过 libxposed service 是否绑定判定（Modern API） */
+    private var isModuleActive by mutableStateOf(false)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         // Edge-to-edge 纯黑
@@ -34,11 +36,16 @@ class SettingsActivity : ComponentActivity() {
 
         super.onCreate(savedInstanceState)
 
-        // 使用 XposedPrefs 桥接 — 自动处理 MODE_WORLD_READABLE / fallback / 权限
-        val prefs = XposedPrefs.module(this, PREFS_NAME)
+        // Modern API：通过 XposedServiceHelper 绑定框架服务，
+        // isModuleActive 以 service 是否绑定判定（旧版自 Hook onCreate 的方式
+        // 在 API 101+ 已不可能 —— 模块 App 不再被 hook）
+        hk.kirk.trustme.xprefs.XposedPrefs.ServiceHolder.register()
+        hk.kirk.trustme.xprefs.XposedPrefs.ServiceHolder.addListener { svc ->
+            isModuleActive = svc != null
+        }
 
-        // 确保日志文件对 Hook 进程可读可写
-        prefs.makeFileWorldWritable("trustme_logs.jsonl")
+        // 使用 XposedPrefs 桥接 — Remote Preferences + 本地镜像
+        val prefs = XposedPrefs.module(this, PREFS_NAME)
 
         val versionName = try {
             packageManager.getPackageInfo(packageName, 0).versionName ?: "1.0.0"

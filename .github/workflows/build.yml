@@ -1,14 +1,13 @@
-name: Build & Release
+name: Build Release APK
 
 on:
   push:
     tags: ['v*']
-  pull_request:
-    branches: [main]
+  workflow_dispatch:
 
 jobs:
   build:
-    name: Build APK
+    name: Build Release APK
     runs-on: ubuntu-latest
 
     steps:
@@ -30,9 +29,6 @@ jobs:
         run: |
           printf '%s' "$KEYSTORE_BASE64" | base64 -d > app/trustme-release.jks
 
-      - name: Build Debug APK
-        run: ./gradlew assembleDebug
-
       - name: Build Release APK
         env:
           KEYSTORE_PATH: trustme-release.jks
@@ -40,12 +36,6 @@ jobs:
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: ./gradlew assembleRelease
-
-      - name: Upload Debug APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: TrustMe-debug
-          path: app/build/outputs/apk/debug/*.apk
 
       - name: Upload Release APK
         uses: actions/upload-artifact@v4
@@ -72,5 +62,4 @@ jobs:
         with:
           generate_release_notes: true
           files: |
-            artifacts/TrustMe-debug/*.apk
             artifacts/TrustMe-release/*.apk

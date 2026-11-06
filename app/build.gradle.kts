@@ -11,8 +11,8 @@ android {
         applicationId = "hk.kirk.trustme"
         minSdk = 26
         targetSdk = 36
-        versionCode = 10
-        versionName = "1.3.0"
+        versionCode = 11
+        versionName = "1.3.0-API102"
     }
 
     signingConfigs {
@@ -49,9 +49,15 @@ android {
 
     // Apache HTTP legacy 库支持
     useLibrary("org.apache.http.legacy")
+
+    packaging {
+        resources {
+            merges += "META-INF/xposed/*"
+        }
+    }
 }
 
-// Rename APK output: TrustMe-v1.0.3-release.apk
+// Rename APK output: TrustMe-v1.3.0-API102-release.apk
 androidComponents {
     onVariants { variant ->
         variant.outputs.forEach { output ->
@@ -65,8 +71,10 @@ androidComponents {
 }
 
 dependencies {
-    // Xposed API — compileOnly，不打包进 APK
-    compileOnly("de.robv.android.xposed:api:82")
+    // libxposed Modern API — compileOnly，不打包进 APK
+    compileOnly("io.github.libxposed:api:102.0.0")
+    // libxposed service — 模块 App 端与框架通信（Remote Preferences / 作用域管理）
+    implementation("io.github.libxposed:service:102.0.0")
 
     // Apache HTTP 组件
     implementation("org.apache.httpcomponents:httpcore:4.4.16")

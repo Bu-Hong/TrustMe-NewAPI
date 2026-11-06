@@ -1,21 +1,28 @@
 package hk.kirk.trustme.xprefs
 
+import android.content.SharedPreferences
+
 /**
- * Hook 端全局配置快捷入口
+ * Hook 端全局配置快捷入口（单例桥）
  *
- * 简化 Hook 回调中的开关检查：
+ * Hook 回调中的开关检查：
  * ```kotlin
  * if (!HookPrefs.isHookActive("okhttp")) return
  * ```
+ *
+ * Modern API：由 MainHook 在 onModuleLoaded 时注入 RemotePreferences
  */
 object HookPrefs {
-    private const val MY_PACKAGE = "hk.kirk.trustme"
     private const val PREFS_NAME = "trustme_prefs"
 
-    private val prefs = XposedPrefs.hook(MY_PACKAGE, PREFS_NAME)
+    /** Hook 端远程首选项，由 MainHook 注入 */
+    @Volatile
+    internal var remote: SharedPreferences? = null
 
-    /** prefs 文件是否可读 */
-    val isAvailable: Boolean get() = prefs.isAvailable
+    private val prefs = XposedPrefs.HookSide(PREFS_NAME)
+
+    /** prefs 是否可读 */
+    val isAvailable: Boolean get() = remote != null && prefs.isAvailable
 
     /** 全局开关是否开启 */
     fun isEnabled(): Boolean = prefs.getBoolean("enabled", true)
@@ -28,6 +35,15 @@ object HookPrefs {
         return prefs.getBoolean("enabled", true) && prefs.getBoolean("hook_$hookName", true)
     }
 
-    /** 重新加载配置 */
+    /** 重新加载配置（远程首选项实时同步，保留兼容接口） */
     fun reload() = prefs.reload()
+
+    /** MainHook 注入入口 */
+    fun attach(sp: SharedPreferences?) {
+        remote = sp
+        prefs.remote = sp
+    }
+
+    /** getBoolean 转发（供 MainHook 使用） */
+    fun getBoolean(key: String, default: Boolean): Boolean = prefs.getBoolean(key, default)
 }

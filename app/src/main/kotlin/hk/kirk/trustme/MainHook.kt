@@ -1,25 +1,25 @@
 package hk.kirk.trustme
 
-import android.content.Context
-import de.robv.android.xposed.IXposedHookLoadPackage
-import de.robv.android.xposed.IXposedHookZygoteInit
-import de.robv.android.xposed.XC_MethodHook
-import de.robv.android.xposed.XposedHelpers
-import de.robv.android.xposed.XposedHelpers.findAndHookMethod
-import de.robv.android.xposed.callbacks.XC_LoadPackage.LoadPackageParam
-import hk.kirk.trustme.hooks.*
-import hk.kirk.trustme.utils.Logger
-import hk.kirk.trustme.utils.LogFileWriter
-import hk.kirk.trustme.xprefs.XposedPrefs
+import io.github.libxposed.api.XposedModule
+import io.github.libxposed.api.XposedModuleInterface.ModuleLoadedParam
+import io.github.libxposed.api.XposedModuleInterface.PackageLoadedParam
 
 /**
- * TrustMe main entry point
+ * TrustMe main entry point (libxposed modern API 102)
  *
- * 同时实现 IXposedHookLoadPackage 和 IXposedHookZygoteInit：
- * - initZygote: 在 Zygote 进程中初始化，执行全局 Hook（Conscrypt TrustManagerImpl 动态反射）
- * - handleLoadPackage: 每个 App 加载时执行，按模块分发 Hook
+ * 旧版 API（被移除/失效，已按官方文档迁移）：
+ * - IXposedHookZygoteInit / initZygote —— API 101 起模块不再注入 Zygote，改为在每个作用域进程内加载（onModuleLoaded）
+ * - IXposedHookLoadPackage / handleLoadPackage —— 改为 onPackageLoaded(PackageLoadedParam)
+ * - de.robv.android.xposed.XposedHelpers.findAndHookMethod —— 框架不再提供，改为 hook(Executable).intercept(Chain)
+ * - de.robv.android.xposed.XC_MethodHook —— 改为 XposedInterface.Hooker 拦截器链模型
+ * - de.robv.android.xposed.XposedBridge.hookMethod —— 改为 hook(Executable)
+ * - XposedBridge.log —— 改为 log(priority, tag, msg)
+ * - assets/xposed_init —— 改为 META-INF/xposed/java_init.list
+ *
+ * 保留（新版 API 仍然可用 / 迁移后的替代实现）：
+ * - 模块配置读取迁移到 Remote Preferences（Modern API 首选方案，见 xprefs/XposedPrefs.kt）
  */
-class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
+class MainHook : XposedModule() {
 
     companion object {
         private const val TAG = "TrustMe"
@@ -27,72 +27,57 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
         private const val PREFS_NAME = "trustme_prefs"
     }
 
-    /** Hook 端的配置桥 — 通过 XposedPrefs 读取模块 UI 端的设置 */
-    private val prefs = XposedPrefs.hook(MY_PACKAGE, PREFS_NAME)
+    /** Hook 端的配置桥 — HookPrefs 单例（RemotePreferences 注入后共享） */
+    private val prefs get() = hk.kirk.trustme.xprefs.HookPrefs
 
     // ==========================================
-    // Zygote 级别初始化（对所有进程生效）
+    // 模块加载（替代旧版 initZygote 入口）
+    // API 101 起，模块在作用域 App 进程内加载，不再有 Zygote 阶段
     // ==========================================
 
-    override fun initZygote(startupParam: IXposedHookZygoteInit.StartupParam) {
-        Logger.i("$TAG initZygote — 模块正在加载...")
+    override fun onModuleLoaded(param: ModuleLoadedParam) {
+        super.onModuleLoaded(param)
+        log(android.util.Log.INFO, TAG, "onModuleLoaded — process: ${param.processName}")
+        log(
+            android.util.Log.INFO, TAG,
+            "framework: $frameworkName ($frameworkVersionCode) API $apiVersion"
+        )
+        Logger.attach(this)
 
-        Logger.i("$TAG Prefs 可读: ${prefs.isAvailable}, 全局开关: ${prefs.getBoolean("enabled", true)}")
-
-        // Zygote 级别：动态反射 Hook TrustManagerImpl.checkTrustedRecursive
-        // 这是最底层的 Hook 点，无需 ClassLoader
-        // 注意：Hook 回调内部会动态检查开关状态，关闭开关后不会绕过 SSL
+        // 注入远程首选项到 Hook 端配置桥（Modern API: getRemotePreferences）
         try {
-            TrustManagerImplHook.hookZygote()
-            Logger.i("$TAG Zygote 级别 Conscrypt Hook 完成（回调内含运行时开关检查）")
-        } catch (e: Throwable) {
-            Logger.e("$TAG Zygote 级别 Hook 失败", e)
+            hk.kirk.trustme.xprefs.HookPrefs.attach(getRemotePreferences(PREFS_NAME))
+            log(android.util.Log.INFO, TAG, "RemotePreferences 已注入 (可读: ${prefs.isAvailable})")
+        } catch (t: Throwable) {
+            log(android.util.Log.WARN, TAG, "RemotePreferences 注入失败（框架可能不支持远程能力）", t)
         }
     }
 
     // ==========================================
-    // 每个 App 加载时执行
+    // 每个 App 包加载时执行（替代旧版 handleLoadPackage）
     // ==========================================
 
-    override fun handleLoadPackage(lpparam: LoadPackageParam) {
-        // 对自身包名：Hook onCreate，在 UI 构建前将 isModuleActive 设为 true
-        if (lpparam.packageName == MY_PACKAGE) {
-            try {
-                findAndHookMethod(
-                    "hk.kirk.trustme.ui.SettingsActivity",
-                    lpparam.classLoader,
-                    "onCreate",
-                    android.os.Bundle::class.java,
-                    object : XC_MethodHook() {
-                        override fun beforeHookedMethod(param: MethodHookParam) {
-                            val clazz = param.thisObject.javaClass
-                            XposedHelpers.setStaticBooleanField(clazz, "isModuleActive", true)
-                        }
-                    }
-                )
-                Logger.i("$TAG 模块激活状态 Hook 完成")
-            } catch (e: Throwable) {
-                Logger.e("$TAG 模块激活状态 Hook 失败", e)
-            }
-            return
-        }
+    override fun onPackageLoaded(param: PackageLoadedParam) {
+        super.onPackageLoaded(param)
+
+        val packageName = param.packageName
 
         // 重新加载配置
         prefs.reload()
 
         // 检查全局开关
         if (!prefs.getBoolean("enabled", true)) {
-            Logger.i("全局开关已关闭，跳过 ${lpparam.packageName} (prefs可读: ${prefs.isAvailable})")
+            log(android.util.Log.INFO, TAG, "全局开关已关闭，跳过 $packageName (prefs可读: ${prefs.isAvailable})")
             return
         }
 
         // 更新日志开关
         Logger.setLoggingEnabled(prefs.getBoolean("logging", true))
 
-        Logger.d("处理 App: ${lpparam.packageName}")
-        LogFileWriter.init(lpparam.packageName)
+        log(android.util.Log.DEBUG, TAG, "处理 App: $packageName")
+        LogFileWriter.init(packageName)
 
-        val cl = lpparam.classLoader
+        val cl = param.classLoader
 
         // ===== 系统级 Hook（直接在当前 ClassLoader 中 Hook） =====
 
@@ -103,6 +88,8 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
         hookSafely("TrustManager") { TrustManagerHook.hook(cl) }
 
         // 3. Conscrypt TrustManagerImpl（App 级别的硬编码 Hook）
+        //    旧版通过 initZygote 无 ClassLoader 反射 Hook，API 101+ 无法再注入 Zygote，
+        //    统一在 App 进程内完成（本回调时机足够早，功能等价）
         hookSafely("Conscrypt") { TrustManagerImplHook.hookApp(cl) }
 
         // 4. HttpsURLConnection
@@ -122,35 +109,35 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
 
         // ===== Multi-dex 支持：通过 Application.attach 延迟加载第三方库 Hook =====
         try {
-            findAndHookMethod(
-                "android.app.Application",
-                cl,
-                "attach",
-                Context::class.java,
-                object : XC_MethodHook() {
-                    override fun afterHookedMethod(param: MethodHookParam) {
-                        val context = param.args[0] as Context
-                        val appClassLoader = context.classLoader
+            val appClass = cl.loadClass("android.app.Application")
+            val attach = appClass.getDeclaredMethod("attach", android.content.Context::class.java)
+            hook(attach).intercept { chain ->
+                val result = chain.proceed()
+                try {
+                    val context = chain.args[0] as android.content.Context
+                    val appClassLoader = context.classLoader
 
-                        // 9. OkHttp (2.x / 3.x / 4.x+)
-                        hookSafely("OkHttp") { OkHttpHook.hook(appClassLoader, context.applicationInfo) }
+                    // 9. OkHttp (2.x / 3.x / 4.x+)
+                    hookSafely("OkHttp") { OkHttpHook.hook(appClassLoader, context.applicationInfo) }
 
-                        // 10. Apache HTTP Client
-                        hookSafely("Apache") { ApacheHttpHook.hook(appClassLoader) }
+                    // 10. Apache HTTP Client
+                    hookSafely("Apache") { ApacheHttpHook.hook(appClassLoader) }
 
-                        // 11. Cronet
-                        hookSafely("Cronet") { CronetHook.hook(appClassLoader) }
+                    // 11. Cronet
+                    hookSafely("Cronet") { CronetHook.hook(appClassLoader) }
 
-                        // 12. 第三方库 (xutils, httpclientandroidlib)
-                        hookSafely("ThirdParty") { ThirdPartyHook.hook(appClassLoader) }
-                    }
+                    // 12. 第三方库 (xutils, httpclientandroidlib)
+                    hookSafely("ThirdParty") { ThirdPartyHook.hook(appClassLoader) }
+                } catch (t: Throwable) {
+                    Logger.e("Application.attach 后置 Hook 失败", t)
                 }
-            )
-        } catch (e: Throwable) {
-            Logger.e("Hook Application.attach 失败", e)
+                result
+            }
+        } catch (t: Throwable) {
+            Logger.e("Hook Application.attach 失败", t)
 
             // 回退：直接在当前 ClassLoader 中尝试
-            hookSafely("OkHttp") { OkHttpHook.hook(cl, lpparam.appInfo) }
+            hookSafely("OkHttp") { OkHttpHook.hook(cl, param.applicationInfo) }
             hookSafely("Apache") { ApacheHttpHook.hook(cl) }
             hookSafely("Cronet") { CronetHook.hook(cl) }
             hookSafely("ThirdParty") { ThirdPartyHook.hook(cl) }
@@ -162,7 +149,7 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
      */
     private fun hookSafely(hookName: String, block: () -> Unit) {
         if (!prefs.getBoolean("hook_${hookName.lowercase()}", true)) {
-            Logger.d("$hookName Hook 已禁用，跳过")
+            log(android.util.Log.DEBUG, TAG, "$hookName Hook 已禁用，跳过")
             return
         }
         try {

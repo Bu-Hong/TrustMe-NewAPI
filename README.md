@@ -1,6 +1,13 @@
-# TrustMe
+# TrustMe (TrustMe-NewAPI)
 
-A comprehensive SSL/TLS certificate pinning bypass module for **LSPosed** / **Zygisk** on Android.
+A comprehensive SSL/TLS certificate pinning bypass module for **LSPosed** on Android.
+
+> **This fork (TrustMe-NewAPI)** migrates the module from the legacy `de.robv.android.xposed` API to the **libxposed Modern API 102** (`io.github.libxposed:api:102.0.0`), so it works fully on LSPosed frameworks with API 101/102. Key changes:
+> - Entry class extends `XposedModule` (`onModuleLoaded` / `onPackageLoaded`); Zygote injection removed (no longer possible since API 101)
+> - Hooks use the interceptor-chain model `hook(Executable).intercept(Chain)` instead of `XposedHelpers` / `XC_MethodHook`
+> - Module metadata moved to `META-INF/xposed/` (`java_init.list`, `module.prop`, `scope.list`)
+> - Settings storage migrated to **Remote Preferences** (legacy `XSharedPreferences` unavailable when targeting API 102)
+> - Version: `1.3.0-API102`
 
 TrustMe provides a unified approach to SSL/TLS certificate pinning bypass with a modern Jetpack Compose settings UI and fine-grained per-hook toggle controls.
 

@@ -1,14 +1,12 @@
 package hk.kirk.trustme.hooks
 
-import de.robv.android.xposed.XC_MethodHook
-import de.robv.android.xposed.XposedBridge
-import de.robv.android.xposed.XposedHelpers.findAndHookMethod
-import de.robv.android.xposed.XposedHelpers.findClass
+import hk.kirk.trustme.XCompat
 import hk.kirk.trustme.utils.Logger
 import hk.kirk.trustme.xprefs.HookPrefs
 import java.lang.reflect.Method
 import java.lang.reflect.ParameterizedType
 import java.security.cert.X509Certificate
+import java.util.ArrayList
 import javax.net.ssl.SSLParameters
 import javax.net.ssl.SSLSession
 
@@ -18,152 +16,108 @@ import javax.net.ssl.SSLSession
  * 策略A：硬编码 Hook 已知方法签名
  * 策略B：反射动态发现 checkTrustedRecursive 所有重载
  * 额外：Hook verifyChain
+ *
+ * Modern API：hook(Executable).intercept(Chain)
+ * 注：旧版的 Zygote 级别 Hook（initZygote）在 API 101+ 已不可能（模块不再注入 Zygote），
+ *     统一在 App 进程内安装，功能等价。
  */
 object TrustManagerImplHook {
 
     private const val IMPL_CLASS = "com.android.org.conscrypt.TrustManagerImpl"
-    private val emptyList = ArrayList<X509Certificate>()
 
     /**
-     * 运行时检查开关的替换回调 — 用于 Zygote 级别 Hook
-     * 每次方法被调用时都会重新加载 prefs 并检查开关状态
+     * 运行时检查开关的替换回调
+     * 每次方法被调用时都会检查开关状态：
+     * 开关关闭 → proceed 让原始方法正常执行；开关打开 → 拦截并返回空列表
      */
-    private fun createDynamicReplacement() = object : XC_MethodHook() {
-        override fun beforeHookedMethod(param: MethodHookParam) {
-            if (!HookPrefs.isHookActive("conscrypt")) {
-                // 开关关闭，不拦截，让原始方法正常执行
-                return
-            }
-            // 开关打开，拦截并返回空列表
-            param.result = ArrayList<X509Certificate>()
-        }
-    }
-
-    /**
-     * Zygote 级别 Hook — 使用 TrustMeAlready 的动态反射策略
-     * 在 Zygote 进程中执行，对所有 App 生效
-     */
-    fun hookZygote() {
-        if (!hasTrustManagerImpl()) {
-            Logger.i("TrustManagerImpl 不存在，跳过 Zygote Hook")
-            return
-        }
-
-        var hookedCount = 0
-
-        // 策略B：动态反射发现 checkTrustedRecursive 的所有重载
-        try {
-            val cls = findClass(IMPL_CLASS, null)
-            for (method in cls.declaredMethods) {
-                if (!isCheckTrustedRecursive(method)) continue
-
-                val params = mutableListOf<Any>()
-                params.addAll(method.parameterTypes.toList())
-                params.add(createDynamicReplacement())
-
-                try {
-                    findAndHookMethod(IMPL_CLASS, null, "checkTrustedRecursive", *params.toTypedArray())
-                    hookedCount++
-                    Logger.d("Zygote Hook: checkTrustedRecursive(${method.parameterTypes.joinToString { it.simpleName }})")
-                } catch (e: Throwable) {
-                    Logger.e("Zygote Hook checkTrustedRecursive 变体失败", e)
+    private fun createDynamicReplacement(method: Method) {
+        XCompat.hookMethod(
+            method,
+            before = { _, _ ->
+                if (!HookPrefs.isHookActive("conscrypt")) {
+                    // 开关关闭，不拦截，让原始方法正常执行（返回 null 继续 proceed）
+                    return@hookMethod null
                 }
+                // 开关打开，拦截并返回空列表
+                ArrayList<X509Certificate>()
             }
-        } catch (e: Throwable) {
-            Logger.e("Zygote 动态反射 Hook 失败", e)
-        }
-
-        Logger.i("Zygote 级别 Hook 完成: $hookedCount 个 checkTrustedRecursive 方法")
+        )
     }
 
     /**
-     * App 级别 Hook — 使用 JustTrustMe 的硬编码策略
-     * 补充 Zygote Hook 未覆盖的方法
+     * App 级别 Hook — 使用 JustTrustMe 的硬编码策略 + 动态反射策略
      */
     fun hookApp(classLoader: ClassLoader) {
         if (!hasTrustManagerImpl()) return
 
-        // checkServerTrusted(X509Certificate[], String) → return 0
+        val cls = try {
+            classLoader.loadClass(IMPL_CLASS)
+        } catch (_: Throwable) {
+            return
+        }
+
+        // checkServerTrusted(X509Certificate[], String) → return null
         try {
-            findAndHookMethod(
-                IMPL_CLASS, classLoader,
+            val m = cls.getDeclaredMethod(
                 "checkServerTrusted",
-                Array<X509Certificate>::class.java, String::class.java,
-                object : XC_MethodHook() {
-                    override fun beforeHookedMethod(param: MethodHookParam) {
-                        if (!HookPrefs.isHookActive("conscrypt")) return
-                        Logger.d("TrustManagerImpl.checkServerTrusted(cert[], String) → 已绕过")
-                        param.result = null
-                    }
+                Array<X509Certificate>::class.java, String::class.java
+            )
+            XCompat.hookMethod(
+                m,
+                before = { _, _ ->
+                    if (!HookPrefs.isHookActive("conscrypt")) return@hookMethod null
+                    Logger.d("TrustManagerImpl.checkServerTrusted(cert[], String) → 已绕过")
+                    null
                 }
             )
         } catch (_: Throwable) {
         }
 
-        // checkServerTrusted(X509Certificate[], String, String) → return ArrayList()
-        try {
-            findAndHookMethod(
-                IMPL_CLASS, classLoader,
-                "checkServerTrusted",
-                Array<X509Certificate>::class.java, String::class.java, String::class.java,
-                createDynamicReplacement()
-            )
-        } catch (_: Throwable) {
-        }
-
-        // checkServerTrusted(X509Certificate[], String, SSLSession) → return ArrayList()
-        try {
-            findAndHookMethod(
-                IMPL_CLASS, classLoader,
-                "checkServerTrusted",
-                Array<X509Certificate>::class.java, String::class.java, SSLSession::class.java,
-                createDynamicReplacement()
-            )
-        } catch (_: Throwable) {
-        }
-
-        // checkTrusted(X509Certificate[], String, SSLSession, SSLParameters, boolean)
-        try {
-            findAndHookMethod(
-                IMPL_CLASS, classLoader,
-                "checkTrusted",
-                Array<X509Certificate>::class.java, String::class.java,
-                SSLSession::class.java, SSLParameters::class.java,
-                Boolean::class.javaPrimitiveType,
-                createDynamicReplacement()
-            )
-        } catch (_: Throwable) {
-        }
-
-        // checkTrusted(X509Certificate[], byte[], byte[], String, String, boolean)
-        try {
-            findAndHookMethod(
-                IMPL_CLASS, classLoader,
-                "checkTrusted",
-                Array<X509Certificate>::class.java, ByteArray::class.java, ByteArray::class.java,
-                String::class.java, String::class.java,
-                Boolean::class.javaPrimitiveType,
-                createDynamicReplacement()
-            )
-        } catch (_: Throwable) {
-        }
-
-        // verifyChain
-        try {
-            val cls = findClass(IMPL_CLASS, classLoader)
-            for (method in cls.declaredMethods) {
-                if (method.name == "verifyChain" && method.returnType == List::class.java) {
-                    val params = mutableListOf<Any>()
-                    params.addAll(method.parameterTypes.toList())
-                    params.add(createDynamicReplacement())
-                    try {
-                        findAndHookMethod(IMPL_CLASS, classLoader, "verifyChain", *params.toTypedArray())
+        // 动态反射发现所有 checkServerTrusted / checkTrusted / checkTrustedRecursive / verifyChain 重载
+        for (method in cls.declaredMethods) {
+            try {
+                when {
+                    isCheckTrustedRecursive(method) -> {
+                        createDynamicReplacement(method)
+                        Logger.d("Hook: checkTrustedRecursive(${method.parameterTypes.joinToString { it.simpleName }})")
+                    }
+                    // checkServerTrusted(X509Certificate[], String, String) → return ArrayList()
+                    method.name == "checkServerTrusted" &&
+                        method.parameterTypes.size == 3 &&
+                        method.parameterTypes[0] == Array<X509Certificate>::class.java &&
+                        method.parameterTypes[1] == String::class.java &&
+                        method.parameterTypes[2] == String::class.java -> {
+                        createDynamicReplacement(method)
+                        Logger.d("Hook: checkServerTrusted(cert[], String, String)")
+                    }
+                    // checkServerTrusted(X509Certificate[], String, SSLSession) → return ArrayList()
+                    method.name == "checkServerTrusted" &&
+                        method.parameterTypes.size == 3 &&
+                        method.parameterTypes[0] == Array<X509Certificate>::class.java &&
+                        method.parameterTypes[1] == String::class.java &&
+                        method.parameterTypes[2] == SSLSession::class.java -> {
+                        createDynamicReplacement(method)
+                        Logger.d("Hook: checkServerTrusted(cert[], String, SSLSession)")
+                    }
+                    // checkTrusted(X509Certificate[], String, SSLSession, SSLParameters, boolean)
+                    // checkTrusted(X509Certificate[], byte[], byte[], String, String, boolean)
+                    method.name == "checkTrusted" &&
+                        method.parameterTypes.isNotEmpty() &&
+                        method.parameterTypes[0] == Array<X509Certificate>::class.java &&
+                        (method.parameterTypes.contains(SSLParameters::class.java) ||
+                            method.parameterTypes.contains(ByteArray::class.java)) -> {
+                        createDynamicReplacement(method)
+                        Logger.d("Hook: checkTrusted(${method.parameterTypes.joinToString { it.simpleName }})")
+                    }
+                    // verifyChain
+                    method.name == "verifyChain" &&
+                        List::class.java.isAssignableFrom(method.returnType) -> {
+                        createDynamicReplacement(method)
                         Logger.d("TrustManagerImpl.verifyChain() → 已 Hook")
-                    } catch (_: Throwable) {
                     }
                 }
+            } catch (_: Throwable) {
             }
-        } catch (_: Throwable) {
         }
 
         Logger.d("TrustManagerImplHook (App 级别) 已安装")
