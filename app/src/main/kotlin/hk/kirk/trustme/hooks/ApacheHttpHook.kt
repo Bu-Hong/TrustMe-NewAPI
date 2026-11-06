@@ -67,7 +67,7 @@ object ApacheHttpHook {
         // DefaultHttpClient(HttpParams)
         try {
             val ctor = cls.getDeclaredConstructor(org.apache.http.params.HttpParams::class.java)
-            XCompat.hookMethod(ctor, after = { args, _, thisObj ->
+            XCompat.hookMethod(ctor, after = { _, args, thisObj ->
                 if (!HookPrefs.isHookActive("apache")) return@hookMethod null
                 thisObj?.let {
                     setObjectField(it, "defaultParams", args[0])
@@ -84,14 +84,14 @@ object ApacheHttpHook {
                 ClientConnectionManager::class.java,
                 org.apache.http.params.HttpParams::class.java,
             )
-            XCompat.hookMethod(ctor, after = { args, _, thisObj ->
+            XCompat.hookMethod(ctor, after = { _, args, thisObj ->
                 if (!HookPrefs.isHookActive("apache")) return@hookMethod null
                 thisObj?.let {
                     val params = args[1] as org.apache.http.params.HttpParams
                     setObjectField(it, "defaultParams", params)
                     setObjectField(
                         it, "connManager",
-                        determineConnManager(args[0]!!, params)
+                        determineConnManager(args[0] ?: return@hookMethod null, params)
                     )
                 }
                 null
@@ -116,7 +116,7 @@ object ApacheHttpHook {
                 KeyStore::class.java, SecureRandom::class.java,
                 org.apache.http.conn.scheme.HostNameResolver::class.java,
             )
-            XCompat.hookMethod(ctor, after = { args, _, thisObj ->
+            XCompat.hookMethod(ctor, after = { _, args, thisObj ->
                 if (!HookPrefs.isHookActive("apache")) return@hookMethod null
                 thisObj?.let { obj ->
                     val algorithm = args[0] as String

@@ -2,7 +2,7 @@ package hk.kirk.trustme
 
 import android.util.Log
 import io.github.libxposed.api.XposedInterface
-import java.lang.reflect.Member
+import java.lang.reflect.Executable
 
 /**
  * 兼容桥：将旧版 XposedBridge / XposedHelpers 的调用习惯翻译为 Modern API。
@@ -37,7 +37,7 @@ object XCompat {
      * before 返回 null 表示继续执行原方法。
      */
     fun hookMethod(
-        member: Member,
+        member: Executable,
         before: ((args: List<Any?>, thisObject: Any?) -> Any?)? = null,
         after: ((result: Any?, args: List<Any?>, thisObject: Any?) -> Any?)? = null,
     ) {
@@ -62,7 +62,7 @@ object XCompat {
      * transform 返回新的参数数组；返回 null 表示不修改。
      */
     fun hookMethodArgs(
-        member: Member,
+        member: Executable,
         transform: (args: List<Any?>) -> Array<Any?>?,
     ) {
         x().hook(member).intercept { chain ->
