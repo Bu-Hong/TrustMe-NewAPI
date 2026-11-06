@@ -56,7 +56,7 @@ class MainHook : XposedModule() {
             android.util.Log.INFO, TAG,
             "framework: $frameworkName ($frameworkVersionCode) API $apiVersion"
         )
-        Logger.attach(this)
+        Logger.attach(this) // XposedModule implements XposedInterface
 
         // 注入远程首选项到 Hook 端配置桥（Modern API: getRemotePreferences）
         try {
@@ -91,7 +91,7 @@ class MainHook : XposedModule() {
         log(android.util.Log.DEBUG, TAG, "处理 App: $packageName")
         LogFileWriter.init(packageName)
 
-        val cl = param.classLoader
+        val cl = param.getDefaultClassLoader()
 
         // ===== 系统级 Hook（直接在当前 ClassLoader 中 Hook） =====
 
