@@ -27,7 +27,21 @@ jobs:
         env:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
         run: |
-          printf '%s' "$KEYSTORE_BASE64" | base64 -d > app/trustme-release.jks
+          printf '%s' "$KEYSTORE_BASE64" | base64 -d > app/trustme-release.p12
+          # Convert PKCS12 to JKS with JDK keytool for maximum compatibility
+          keytool -importkeystore \
+            -srckeystore app/trustme-release.p12 -srcstoretype PKCS12 \
+            -srcstorepass "$KEYSTORE_PASSWORD" \
+            -destkeystore app/trustme-release.jks -deststoretype JKS \
+            -deststorepass "$KEYSTORE_PASSWORD" \
+            -srcalias "$KEY_ALIAS" -destalias "$KEY_ALIAS" \
+            -srckeypass "$KEY_PASSWORD" -destkeypass "$KEY_PASSWORD" \
+            -noprompt
+          rm app/trustme-release.p12
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
 
       - name: Build Release APK
         env:
