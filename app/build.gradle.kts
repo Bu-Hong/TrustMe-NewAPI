@@ -5,7 +5,8 @@ plugins {
 
 android {
     namespace = "hk.kirk.trustme"
-    compileSdk = 36
+    // libxposed service 102.0.0 要求 compileSdk >= 37
+    compileSdk = 37
 
     defaultConfig {
         applicationId = "hk.kirk.trustme"
